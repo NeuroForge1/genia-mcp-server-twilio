@@ -3,6 +3,7 @@ import os
 import json
 import asyncio
 from typing import Dict, Any, AsyncGenerator
+import logging
 
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, Field
@@ -11,7 +12,11 @@ from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
 from dotenv import load_dotenv
 
-# Load environment variables
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables (primarily for local development)
 load_dotenv()
 
 # --- Simplified MCP Message Structures ---
@@ -24,49 +29,50 @@ class SimpleMessage(BaseModel):
     metadata: Dict[str, Any] | None = None
 
 # --- FastAPI App ---
-app = FastAPI()
+app = FastAPI(
+    title="GENIA Simplified MCP Server - Twilio",
+    description="Servidor simplificado para interactuar con Twilio (WhatsApp) vía SSE.",
+)
 
 # --- Twilio Client Initialization ---
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 
+twilio_client = None
 if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER]):
-    print("Error: Faltan variables de entorno de Twilio (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER)")
-    # Allow startup for now, but requests will fail
-    twilio_client = None
+    logger.warning("Faltan variables de entorno de Twilio (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER). Las solicitudes a Twilio fallarán.")
 else:
     try:
         twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        print("Cliente de Twilio inicializado correctamente.")
+        logger.info("Cliente de Twilio inicializado correctamente.")
     except Exception as e:
-        print(f"Error al inicializar cliente de Twilio: {e}")
-        twilio_client = None
+        logger.error(f"Error al inicializar cliente de Twilio: {e}")
 
 # --- MCP Endpoint Logic ---
 async def process_twilio_request(message: SimpleMessage) -> AsyncGenerator[str, None]:
     """Processes the incoming MCP message and interacts with Twilio."""
-    capability = message.metadata.get("capability")
-    params = message.metadata.get("params", {})
-    user_id = message.metadata.get("user_id", "unknown_user") # Get user_id if passed
+    logger.info(f"Servidor Twilio Simplificado recibió: {message.model_dump_json()}")
+    capability = message.metadata.get("capability") if message.metadata else None
+    params = message.metadata.get("params", {}) if message.metadata else {}
+    user_id = message.metadata.get("user_id", "unknown_user") if message.metadata else "unknown_user" # Get user_id if passed
 
     if not twilio_client:
-        error_content = SimpleTextContent(text=json.dumps({"message": "Error interno: Cliente de Twilio no inicializado."}))
+        error_content = SimpleTextContent(text=json.dumps({"message": "Error interno: Cliente de Twilio no inicializado (faltan credenciales).".strip()}))
         error_msg = SimpleMessage(role="error", content=error_content)
         yield json.dumps(error_msg.dict())
+        yield {"event": "end", "data": "Stream ended due to error"}
         return
 
-    if capability == "send_whatsapp_message":
-        to_number = params.get("to")
-        body = params.get("body")
+    try:
+        if capability == "send_whatsapp_message":
+            to_number = params.get("to")
+            body = params.get("body")
 
-        if not to_number or not body:
-            error_content = SimpleTextContent(text=json.dumps({"message": "Parámetros 'to' y 'body' son requeridos para send_whatsapp_message"}))
-            error_msg = SimpleMessage(role="error", content=error_content)
-            yield json.dumps(error_msg.dict())
-            return
+            if not to_number or not body:
+                raise ValueError("Parámetros 'to' y 'body' son requeridos para send_whatsapp_message")
 
-        try:
+            logger.info(f"Ejecutando capacidad: send_whatsapp_message a {to_number}")
             # Ensure 'to' number has the correct prefix
             if not to_number.startswith("whatsapp:"):
                 to_number = f"whatsapp:{to_number}"
@@ -86,20 +92,25 @@ async def process_twilio_request(message: SimpleMessage) -> AsyncGenerator[str, 
             response_content = SimpleTextContent(text=json.dumps(result_data))
             response_msg = SimpleMessage(role="assistant", content=response_content)
             yield json.dumps(response_msg.dict())
+            logger.info(f"Mensaje enviado a Twilio: SID {message_response.sid}, Status {message_response.status}")
 
-        except TwilioRestException as e:
-            error_content = SimpleTextContent(text=json.dumps({"message": f"Error de Twilio: {e.msg}", "details": {"twilio_code": e.code, "status": e.status}}))
-            error_msg = SimpleMessage(role="error", content=error_content)
-            yield json.dumps(error_msg.dict())
-        except Exception as e:
-            error_content = SimpleTextContent(text=json.dumps({"message": f"Error inesperado al enviar mensaje: {str(e)}"}))
-            error_msg = SimpleMessage(role="error", content=error_content)
-            yield json.dumps(error_msg.dict())
+        else:
+            raise ValueError(f"Capacidad no soportada: {capability}")
 
-    else:
-        error_content = SimpleTextContent(text=json.dumps({"message": f"Capacidad no soportada: {capability}"}))
+    except TwilioRestException as e:
+        logger.error(f"Error de Twilio al procesar capacidad 	'{capability}	': {e.msg} (Code: {e.code}, Status: {e.status})", exc_info=True)
+        error_content = SimpleTextContent(text=json.dumps({"message": f"Error de Twilio: {e.msg}", "details": {"twilio_code": e.code, "status": e.status}}))
         error_msg = SimpleMessage(role="error", content=error_content)
         yield json.dumps(error_msg.dict())
+    except Exception as e:
+        logger.exception(f"Error inesperado al procesar capacidad 	'{capability}	': {e}")
+        error_content = SimpleTextContent(text=json.dumps({"message": f"Error inesperado al procesar la solicitud ({capability}): {str(e)}"}))
+        error_msg = SimpleMessage(role="error", content=error_content)
+        yield json.dumps(error_msg.dict())
+    finally:
+        # Signal end
+        yield {"event": "end", "data": "Stream ended"}
+        logger.info("Stream SSE finalizado.")
 
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
@@ -108,17 +119,21 @@ async def mcp_endpoint(request: Request):
         data = await request.json()
         incoming_message = SimpleMessage(**data)
     except Exception as e:
+        logger.error(f"Error al parsear request JSON: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=f"Invalid request format: {e}")
 
     return EventSourceResponse(process_twilio_request(incoming_message))
 
 @app.get("/")
 async def root():
-    return {"message": "Servidor MCP de Twilio para GENIA está activo."}
+    return {"message": "Servidor MCP de Twilio para GENIA está activo. Endpoint SSE (POST) en /mcp"}
 
-# --- Run Server (for local testing) ---
+# --- Run Server (for Render) ---
 if __name__ == "__main__":
     import uvicorn
-    print("Iniciando servidor MCP de Twilio en http://localhost:8003")
-    uvicorn.run(app, host="0.0.0.0", port=8003)
+    # Render provides the PORT environment variable
+    port = int(os.getenv("PORT", 8003)) # Default to 8003 if PORT not set
+    logger.info(f"Iniciando servidor MCP de Twilio en http://0.0.0.0:{port}")
+    # Listen on 0.0.0.0 as required by Render
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False) # Disable reload for production
 
