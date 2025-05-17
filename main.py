@@ -2,10 +2,10 @@
 import os
 import json
 import asyncio
-from typing import Dict, Any, AsyncGenerator
+from typing import Dict, Any, AsyncGenerator, Optional
 import logging
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Form, Depends
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from twilio.rest import Client
@@ -38,6 +38,7 @@ app = FastAPI(
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+BACKEND_WEBHOOK_URL = os.getenv("BACKEND_WEBHOOK_URL", "https://genia-backendmpc.onrender.com/webhook/twilio")
 
 twilio_client = None
 if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER]):
@@ -124,9 +125,60 @@ async def mcp_endpoint(request: Request):
 
     return EventSourceResponse(process_twilio_request(incoming_message))
 
+# --- Webhook Endpoints for Twilio ---
+@app.post("/webhook/twilio")
+@app.post("/webhook/twilio/{path:path}")
+async def twilio_webhook_catchall(
+    request: Request,
+    path: Optional[str] = None,
+    Body: Optional[str] = Form(None),
+    From: Optional[str] = Form(None),
+    To: Optional[str] = Form(None),
+    ProfileName: Optional[str] = Form(None)
+):
+    """
+    Webhook catch-all para recibir mensajes de Twilio desde cualquier ruta que comience con /webhook/twilio.
+    Este endpoint reenvía los datos al backend principal para su procesamiento.
+    """
+    logger.info(f"Webhook recibido de Twilio en ruta: /webhook/twilio/{path if path else ''}")
+    logger.info(f"Detalles: From: {From}, To: {To}, ProfileName: {ProfileName}")
+    
+    if not Body or not From:
+        logger.error("Mensaje recibido sin cuerpo o remitente")
+        raise HTTPException(status_code=400, detail="Mensaje recibido sin cuerpo o remitente")
+    
+    try:
+        # Procesar el mensaje directamente aquí
+        logger.info(f"Mensaje de WhatsApp recibido: {Body}")
+        
+        # Devolver una respuesta vacía a Twilio para evitar mensajes duplicados
+        return {}
+    
+    except Exception as e:
+        logger.exception(f"Error al procesar mensaje de WhatsApp: {e}")
+        # En caso de error, intentar enviar un mensaje de error al usuario
+        try:
+            if From:
+                formatted_sender = From if From.startswith("whatsapp:") else f"whatsapp:{From}"
+                if twilio_client:
+                    from_number = TWILIO_WHATSAPP_NUMBER
+                    if not from_number.startswith("whatsapp:"):
+                        from_number = f"whatsapp:{from_number}"
+                    
+                    twilio_client.messages.create(
+                        from_=from_number,
+                        body="Lo siento, ocurrió un error al procesar tu solicitud. Por favor, intenta de nuevo más tarde.",
+                        to=formatted_sender
+                    )
+        except Exception as send_err:
+            logger.error(f"No se pudo enviar mensaje de error a {From}: {send_err}")
+        
+        # Devolver una respuesta vacía a Twilio
+        return {}
+
 @app.get("/")
 async def root():
-    return {"message": "Servidor MCP de Twilio para GENIA está activo. Endpoint SSE (POST) en /mcp"}
+    return {"message": "Servidor MCP de Twilio para GENIA está activo. Endpoint SSE (POST) en /mcp, Webhook en /webhook/twilio"}
 
 # --- Run Server (for Render) ---
 if __name__ == "__main__":
@@ -136,4 +188,3 @@ if __name__ == "__main__":
     logger.info(f"Iniciando servidor MCP de Twilio en http://0.0.0.0:{port}")
     # Listen on 0.0.0.0 as required by Render
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False) # Disable reload for production
-
