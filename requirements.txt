@@ -4,3 +4,6 @@ twilio
 python-dotenv
 sse-starlette
 pydantic
+python-multipart
+requests
+aiohttp
